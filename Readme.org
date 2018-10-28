@@ -1,0 +1,217 @@
+#+OPTIONS: toc:2
+
+* MPI parallel IPython using ipyarallel
+
+This is a short description how to run an IPython cluster on Piz Daint and
+connect to it via ssh port forwarding.
+
+** Preparation
+1. Install ipyparallel
+  #+BEGIN_SRC bash
+    module load cray-python/3.6.5.1
+    pip install --user ipyparallel
+  #+END_SRC
+
+2. The scripts below assume that you have setup passwordless access to
+   =ela.cscs.ch= as described here: https://user.cscs.ch/access/faq/.
+   And that you have the following in your =~/ssh/.config=.
+  #+BEGIN_EXAMPLE
+  Host daint
+  Hostname daint.cscs.ch
+  User [username]
+  ProxyCommand ssh -q -Y ela -W %h:%p
+
+  Host ela
+  Hostname ela.cscs.ch
+  User [username]
+  #+END_EXAMPLE
+
+** Running jupyter notebook and ipcluster on daint
+The following SBATCH script creates an ipython profile in
+=~/.ipython/profile_job_JOBID= and starts the ipcluster consisting of the
+controller (=ipcontroller=) and the engines (=ipengine=), which are running on the MPI ranks.
+
+=run_jupyter.sbatch= contains a template for submitting a SLURM job:
+#+caption: run_jupyter.sbatch
+#+BEGIN_SRC bash
+  #!/bin/bash -l
+  #SBATCH --job-name=ipcluster
+  #SBATCH --nodes=2
+  #SBATCH --constraint=gpu
+  #SBATCH --ntasks-per-node 12
+  #SBATCH --mail-user=<youremail>
+  #SBATCH --mail-type=ALL
+  #SBATCH --time=00:20:00
+  #SBATCH --output jupyter-log-%J.out
+
+  module load daint-gpu
+  module load cray-python/3.6.5.1
+  module load EasyBuild-custom/cscs
+  module load PyExtensions
+  module load jupyter
+
+  profile=job_${SLURM_JOB_ID}
+  echo "creating profile: ${profile}"
+  ipython profile create ${profile}
+
+  echo "Launching controller"
+  ipcontroller --ip="*" --profile=${profile} &
+  sleep 10
+
+  echo "Launching engines"
+  srun ipengine --profile=${profile} --location=$(hostname) 2> /dev/null 1>&2 &
+
+  ipnport=$(shuf -i8000-9999 -n1)
+
+  XDG_RUNTIME_DIR=""
+  echo "${hostname}:${ipnport}" > jupyter-notebook-port-and-host
+  jupyter-notebook --no-browser --port=${ipnport} --ip=$(hostname -i)
+
+#+END_SRC
+
+Once the job is running, go to the output file, here it is =jupyter-log-[SLURM_JOBID].out=
+and search for the line which contains the URL to the jupyter notebook.
+#+BEGIN_EXAMPLE
+[C 02:54:58.860 NotebookApp]
+
+    Copy/paste this URL into your browser when you connect for the first time,
+    to login with a token:
+        http://148.187.39.212:8077/?token=84fb82de8c0670c88dbe2e26ab5bad4fb8902b1238ac9ef2
+#+END_EXAMPLE
+
+Next step is to bind the port, here it is =8077=, to localhost via ssh port
+forwarding:
+#+BEGIN_SRC bash
+ssh -L 8077:148.187.39.212:8077 daint -f -N
+#+END_SRC
+
+Now you should be able to access the jupyter notebook via the following link:
+#+BEGIN_EXAMPLE
+http://localhost:8077/?token=84fb82de8c0670c88dbe2e26ab5bad4fb8902b1238ac9ef2
+#+END_EXAMPLE
+Note that we have replaced the IP by =localhost=, since we have forwarded the port.
+
+Import =ipyparallel= and connect to your MPI engines. Replace
+=[SLURM_JOB_ID]= by the job id of the slurm job, e.g. use ~squeue -u yourusername -n ipcluster~:
+#+BEGIN_SRC python
+  import ipyparallel as ipp
+  c = ipp.Client(profile='job_[SLURM_JOB_ID]')
+  view = c[:]
+#+END_SRC
+
+Now use the cell magic =%%px= provided by ipyparallel to execute commands on the
+MPI engines. For more information see [[https://ipyparallel.readthedocs.io/en/latest/magics.html][ipyparallel documenation]]. For example:
+#+BEGIN_SRC python
+  %%px
+  import mpi4py as MPI
+  x = MPI.COMM_WORLD.rank
+#+END_SRC
+
+Commands or cells prefixed by =%px= resp. =%%px= will be executed on the
+MPI engines. Remote variables can be retrieved by using the view, e.g
+~view['x'][PID]~ loads the variable =x= of process =PID=.
+
+*** Cleanup
+- Stop the ssh process which forwards the port to your local machine.
+- Delete the ipython profile generated above which is located in
+  ~$HOME/.ipython/profile_job_[SLURM_JOBID]~
+*** Links
+- ipyparallel: [[https://github.com/ipython/ipyparallel][github.com]], [[https://ipyparallel.readthedocs.io/en/latest/magics.html][readthedocs.io]]
+- mpi4py: [[https://github.com/mpi4py/mpi4py][github.com]], [[https://mpi4py.readthedocs.io/en/stable/intro.html][readthedocs.io]]
+
+** Running jupyter notebook locally and connect to ipcluster on daint
+
+Alternatively, it is possible to run jupyter/ipython locally and connect it to
+an ipcluster running on daint by forwarding a couple of ports via ssh.
+
+=run_ipcluster.sbatch= does the same as the sbatch script above, except that it
+does not start a juptyer notebook:
+#+caption: run_ipcluster.sbatch
+#+BEGIN_SRC bash
+#!/bin/bash -l
+#SBATCH --job-name=ipcluster
+#SBATCH --nodes=1
+#SBATCH --constraint=gpu
+#SBATCH --ntasks-per-node 12
+#SBATCH --mail-user=<youremail>
+#SBATCH --mail-type=ALL
+#SBATCH --time=00:20:00
+#SBATCH --output ipcluster-log-%J.out
+
+module load daint-gpu
+module load cray-python/3.6.5.1
+module load EasyBuild-custom/cscs
+module load PyExtensions
+module load jupyter
+
+profile=job_${SLURM_JOB_ID}
+echo "creating profile: ${profile}"
+ipython profile create ${profile}
+
+echo "Launching controller"
+ipcontroller --ip="*" --profile=${profile} &
+sleep 10
+
+echo "Launching engines"
+srun ipengine --profile=${profile} --location=$(hostname)
+#+END_SRC
+
+*After* the ipcluster is running, copy the current ipython profile of the
+current job to your local machine:
+#+BEGIN_SRC bash
+rsync -av ela:~./ipython/profile_job_[SLURM_JOBID] ~/.ipython
+#+END_SRC
+
+Then run ~connect.sh ~/.ipython/profile_job_[SLURM_JOBID]~, it will parse
+~security/ipcontroller-client.json~ and forward the necessary ports.
+
+=connect.sh=:
+#+caption: connect.sh
+#+BEGIN_SRC bash
+  #!/usr/bin/bash -l
+
+  remote=daint
+
+  profile_dir=$1
+  if [[ ! -f ${profile_dir}/security/ipcontroller-client.json || ! -f ${profile_dir}/security/ipcontroller-engine.json ]]; then
+      echo "Error: directory ${profile_dir}/security must contain the following files:" >&2
+      echo "  ipcontroller-client.json" >&2
+      echo "  ipcontroller-engine.json" >&2
+      exit 1
+  fi
+
+  ipc_file=${profile_dir}/security/ipcontroller-client.json
+  ipe_file=${profile_dir}/security/ipcontroller-engine.json
+
+  port_labels=(registration control mux task iopub notification)
+
+  ipc_host=$(grep location $ipc_file | sed -n 's/.*\"location\": \"\(.*\)\".*/\1/ p' )
+
+  echo "Setting up ssh forwarding to ${ipc_host} via ${remote}"
+  for label in ${port_labels[@]};
+  do
+      port=$(grep ${label} ${ipc_file} | sed -n "s/.*\"${label}\": \([0-9]*\).*/\1/ p")
+      echo "bind ${label} to localhost:${port}"
+      ssh -L ${port}:${ipc_host}:${port} ${remote} -N -f  1> /dev/null 2>&1
+  done
+
+  echo "ipcontroller host: ${ipc_host}"
+
+  echo "Ports forwarded over ssh. Now overwrite ${ipc_host} by localhost in: "
+  echo " ${ipc_file}"
+  echo " ${ipe_file}"
+  sed -i 's/\"location\":.*/\"location\": \"localhost\",/' ${ipc_file}
+  sed -i 's/\"location\":.*/\"location\": \"localhost\",/' ${ipe_file}
+
+  jobid=$(echo $1 | sed -n 's/.*profile_job_\([0-9]*\).*/\1/ p')
+
+  echo "Connect to ipcluster:"
+  echo "import ipyparallel as ipp"
+  echo "c = ipp.Client(profile=job_${jobid})"
+  echo "view = c[:]"
+#+END_SRC
+
+*** Cleanup
+- Stop the ssh processes forwarding the ports to your local machine.
+- Delete the ipython profile generated above which is located in
+  ~$HOME/.ipython/profile_job_[SLURM_JOBID]~ on daint and on your local machine
